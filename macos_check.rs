@@ -1,37 +1,280 @@
-//! macOS system health checker — human-readable report
+//! macOS system health checker — human-readable report (no_std edition)
 //!
 //! Checks: CPU, memory, SSD, power, Wi-Fi, Bluetooth, Ethernet,
 //! and ends with a short summary of anything worth attention.
 //!
-//! Uses only the Rust standard library; data comes from standard
-//! macOS tools (sysctl, top, vm_stat, diskutil, df, pmset,
-//! networksetup, system_profiler, ifconfig, route).
+//! Runs without `std`:
+//!   - `#![no_std]` + `extern crate alloc` for Vec / String / format!
+//!   - a tiny POSIX shim (pipe, fork, execvp, waitpid, read, write)
+//!     replaces std::process::Command
+//!   - a write(1)-based println! replaces the std one
+//!   - a malloc-based #[global_allocator] and a #[panic_handler]
+//!   - f64::round is std-only (it calls libm), so a libm shim provides it
+//! Data still comes from standard macOS tools (sysctl, top, vm_stat,
+//! diskutil, df, pmset, networksetup, system_profiler, ifconfig, route).
 //!
 //! Build & run:
-//!   rustc -O macos_check.rs && ./macos_check
+//!   rustc -O -C panic=abort macos_check.rs -o macos_check && ./macos_check
+//!
+//! Notes: `#![no_main]` is required because the `start` lang item (used by
+//! `fn main`) only exists in std; `-C panic=abort` because the default
+//! `panic=unwind` requires `eh_personality`, which also only exists in std.
 
-use std::process::Command;
+#![no_std]
+#![no_main]
 
-// ---------------------------------------------------------------- helpers
+extern crate alloc;
 
-fn run(cmd: &str, args: &[&str]) -> Option<String> {
-    Command::new(cmd)
-        .args(args)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+use alloc::alloc::handle_alloc_error;
+use alloc::ffi::CString;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+use alloc::format;
+use core::alloc::{GlobalAlloc, Layout};
+
+// ------------------------------------------- POSIX / libm shim (macOS only)
+//
+// `#![no_main]` makes rustc treat this as a bare-metal binary, so it does
+// not link the C runtime; `#[link(name = "System")]` pulls in libSystem
+// for malloc, pipe, fork, execvp, waitpid, read/write, _exit, memcpy, ...
+#[link(name = "System")]
+extern "C" {
+    fn pipe(fds: *mut i32) -> i32;
+    fn dup2(old: i32, new: i32) -> i32;
+    fn close(fd: i32) -> i32;
+    fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
+    fn write(fd: i32, buf: *const u8, count: usize) -> isize;
+    fn fork() -> i32;
+    fn execvp(file: *const u8, argv: *const *const u8) -> i32;
+    fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+    fn _exit(code: i32) -> !;
+    fn malloc(size: usize) -> *mut u8;
+    fn free(p: *mut u8);
+    fn realloc(p: *mut u8, size: usize) -> *mut u8;
+    fn posix_memalign(memptr: *mut *mut u8, alignment: usize, size: usize) -> i32;
+    #[link_name = "round"]
+    fn libm_round(x: f64) -> f64;
+}
+
+// ------------------------------------------- global allocator (malloc-based)
+
+struct SystemAlloc;
+
+#[global_allocator]
+static GLOBAL: SystemAlloc = SystemAlloc;
+
+unsafe impl GlobalAlloc for SystemAlloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if layout.align() <= 16 {
+            // macOS malloc is 16-byte aligned, which covers this.
+            let p = malloc(layout.size().max(1));
+            if p.is_null() {
+                handle_alloc_error(layout);
+            }
+            p
+        } else {
+            let mut p = core::ptr::null_mut();
+            if posix_memalign(&mut p, layout.align(), layout.size().max(1)) != 0 || p.is_null() {
+                handle_alloc_error(layout);
+            }
+            p
+        }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
+        free(ptr);
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let p = realloc(ptr, new_size.max(1));
+        if p.is_null() {
+            handle_alloc_error(layout);
+        }
+        p
+    }
+}
+
+// ---------------------------------------------------------------- panic
+
+/// Stub for the `eh_personality` lang item, normally provided by std.
+/// The precompiled `core`/`alloc` rlibs are built with `panic=unwind`, so
+/// their unwind tables reference this symbol; with `-C panic=abort` it is
+/// never actually called. Signature matches std's macOS (DWARF) variant.
+#[no_mangle]
+pub extern "C" fn rust_eh_personality(
+    _version: i32,
+    _actions: u32,
+    _exception_class: u64,
+    _exception_object: *mut core::ffi::c_void,
+    _context: *mut core::ffi::c_void,
+) -> u32 {
+    0
+}
+
+/// Fixed-size fmt sink: the panic handler must not allocate, or an OOM
+/// panic could recurse forever.
+struct FmtBuf {
+    buf: [u8; 512],
+    len: usize,
+}
+
+impl core::fmt::Write for FmtBuf {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for &b in s.as_bytes() {
+            if self.len < self.buf.len() {
+                self.buf[self.len] = b;
+                self.len += 1;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
+    let mut out = FmtBuf {
+        buf: [0u8; 512],
+        len: 0,
+    };
+    let _ = core::fmt::write(&mut out, format_args!("panic: {}\n", info));
+    write_all(2, &out.buf[..out.len]);
+    unsafe {
+        _exit(101);
+    }
+}
+
+// f64::round lives in std (it calls libm); provide it for no_std.
+trait F64Round {
+    fn round(self) -> f64;
+}
+
+impl F64Round for f64 {
+    fn round(self) -> f64 {
+        unsafe { libm_round(self) }
+    }
+}
+
+fn wifexited(status: i32) -> bool {
+    (status & 0x7f) == 0
+}
+
+fn wexitstatus(status: i32) -> i32 {
+    (status >> 8) & 0xff
+}
+
+/// Fork + execvp + waitpid, capturing the child's stdout through a pipe.
+/// Returns (exited_successfully, stdout), or None if the spawn failed.
+fn spawn(cmd: &str, args: &[&str]) -> Option<(bool, String)> {
+    let mut fds = [0i32; 2];
+    if unsafe { pipe(fds.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let pid = unsafe { fork() };
+    if pid < 0 {
+        unsafe {
+            close(fds[0]);
+            close(fds[1]);
+        }
+        return None;
+    }
+    if pid == 0 {
+        // Child: point stdout at the pipe, then replace the image.
+        unsafe {
+            close(fds[0]);
+            dup2(fds[1], 1);
+            if fds[1] > 1 {
+                close(fds[1]);
+            }
+        }
+        let mut argv: Vec<CString> = Vec::with_capacity(args.len() + 1);
+        argv.push(CString::new(cmd).unwrap_or_default());
+        for a in args {
+            argv.push(CString::new(*a).unwrap_or_default());
+        }
+        let mut cargv: Vec<*const u8> = argv.iter().map(|s| s.as_ptr() as *const u8).collect();
+        cargv.push(core::ptr::null());
+        unsafe {
+            execvp(cargv[0], cargv.as_ptr());
+            _exit(127); // exec failed
+        }
+    }
+    // Parent: read everything the child wrote, then reap it.
+    unsafe { close(fds[1]) };
+    let mut out: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = unsafe { read(fds[0], buf.as_mut_ptr(), buf.len()) };
+        if n <= 0 {
+            break;
+        }
+        out.extend_from_slice(&buf[..n as usize]);
+    }
+    unsafe { close(fds[0]) };
+    let mut status = 0i32;
+    let _ = unsafe { waitpid(pid, &mut status, 0) };
+    let ok = wifexited(status) && wexitstatus(status) == 0;
+    Some((ok, from_utf8_lossy(&out)))
 }
 
 /// Like `run`, but keeps the output even on a non-zero exit status.
 /// (e.g. smartctl exits 4 on Apple SSDs even when it read the SMART data fine.)
 fn run_loose(cmd: &str, args: &[&str]) -> Option<String> {
-    Command::new(cmd)
-        .args(args)
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+    spawn(cmd, args).map(|(_, s)| s)
 }
+
+fn run(cmd: &str, args: &[&str]) -> Option<String> {
+    spawn(cmd, args).filter(|(ok, _)| *ok).map(|(_, s)| s)
+}
+
+/// No_std stand-in for String::from_utf8_lossy: invalid bytes become '?'.
+fn from_utf8_lossy(b: &[u8]) -> String {
+    match core::str::from_utf8(b) {
+        Ok(s) => s.to_string(),
+        Err(_) => {
+            let mut out = String::with_capacity(b.len());
+            let mut i = 0;
+            while i < b.len() {
+                match core::str::from_utf8(&b[i..]) {
+                    Ok(s) => {
+                        out.push_str(s);
+                        break;
+                    }
+                    Err(e) => {
+                        let end = i + e.valid_up_to();
+                        out.push_str(unsafe { core::str::from_utf8_unchecked(&b[i..end]) });
+                        i = end + e.error_len().unwrap_or(1);
+                        out.push('?');
+                    }
+                }
+            }
+            out
+        }
+    }
+}
+
+fn write_all(fd: i32, mut buf: &[u8]) {
+    while !buf.is_empty() {
+        let n = unsafe { write(fd, buf.as_ptr(), buf.len()) };
+        if n <= 0 {
+            break;
+        }
+        buf = &buf[n as usize..];
+    }
+}
+
+fn print_line(s: &str) {
+    write_all(1, s.as_bytes());
+    write_all(1, b"\n");
+}
+
+macro_rules! println {
+    () => {
+        print_line("")
+    };
+    ($($t:tt)*) => {
+        print_line(&format!($($t)*))
+    };
+}
+
+// ---------------------------------------------------------------- helpers
 
 /// Value of the first line starting with `prefix` (e.g. "SMART Status:").
 fn field(output: &str, prefix: &str) -> Option<String> {
@@ -767,7 +1010,16 @@ fn summary(r: &Report) {
 
 // ------------------------------------------------------------------ main
 
-fn main() {
+/// Entry point. On macOS the Mach-O entry is the `_main` symbol itself
+/// (rustc links no crt1.o), so the kernel/dyld jumps straight here with
+/// argc in x0 and argv in x1; the return value becomes the exit code.
+#[no_mangle]
+pub extern "C" fn main(_argc: i32, _argv: *const *const u8) -> i32 {
+    run_checks();
+    0
+}
+
+fn run_checks() {
     let host = run("hostname", &[]).unwrap_or_default().trim().to_string();
     let os = run("sw_vers", &["-productVersion"]).unwrap_or_default().trim().to_string();
     let arch = run("uname", &["-m"]).unwrap_or_default().trim().to_string();

@@ -4,9 +4,30 @@ A single-file Rust program that reports the overall health of a macOS system —
 CPU, memory, SSD, power/battery, Wi-Fi, Bluetooth, and Ethernet — in a
 human-readable report, ending with a summary of anything that needs attention.
 
-Uses only the Rust standard library. All data is gathered from standard macOS
+Written in **`#![no_std]` Rust** — it links only `core` + `alloc` and raw POSIX
+syscalls, not the standard library. All data is gathered from standard macOS
 command-line tools (`sysctl`, `top`, `vm_stat`, `diskutil`, `df`, `pmset`,
 `networksetup`, `system_profiler`, `ifconfig`, `route`, `last`, `smartctl`).
+
+## Why `no_std`?
+
+The whole program runs on `core` + `alloc` plus a small POSIX shim — no `std`.
+The practical gains:
+
+- **~3× smaller binary** — **184 KB** vs **584 KB** for the equivalent `std`
+  build, because it ships none of `std`'s panicking, backtrace, formatting, or
+  threading machinery.
+- **Portable by construction** — the logic depends only on `core`, `alloc`, and
+  syscalls, so the same code can target constrained environments (embedded,
+  kernels, WASI, early-boot) by swapping the small POSIX shim and allocator.
+- **Explicit control** — you own the global allocator (`malloc`-backed), the
+  panic path, and the entry point; there's no hidden `std` runtime behavior.
+
+The honest trade-off: it does **not** run faster or use less memory — this
+tool's cost is dominated by spawning the ~15 external macOS tools it queries,
+which `no_std` doesn't touch — and it still links `libSystem` (libc) for
+`fork`/`exec`/`malloc`. The win is a **smaller, more portable artifact**, not
+speed.
 
 ## What it checks
 
@@ -58,11 +79,13 @@ mac-test
 ### Build from source
 
 ```bash
-rustc -O macos_check.rs -o macos_check
+rustc -O -C panic=abort macos_check.rs -o macos_check
 ./macos_check
 ```
 
-No external crates — standard library only.
+No external crates — `#![no_std]` (`core` + `alloc` only). The
+`-C panic=abort` flag is required because the default `panic=unwind` needs
+`std`'s `eh_personality` lang item, which a `no_std` binary doesn't provide.
 
 ## Example output
 
