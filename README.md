@@ -30,7 +30,26 @@ command-line tools (`sysctl`, `top`, `vm_stat`, `diskutil`, `df`, `pmset`,
 
 ## Usage
 
-### Pre-built binary (Apple Silicon / arm64)
+### Quick setup (macOS ARM / Apple Silicon)
+
+One-liner: fetch the pre-built binary from this repo into `/usr/local/bin` and
+run it immediately — no build required:
+
+```bash
+(curl -L https://raw.githubusercontent.com/tuhuynh27/mac-test/main/release/macos_check-arm64 -o /usr/local/bin/mac-test && chmod +x /usr/local/bin/mac-test) || sudo sh -c 'curl -L https://raw.githubusercontent.com/tuhuynh27/mac-test/main/release/macos_check-arm64 -o /usr/local/bin/mac-test && chmod +x /usr/local/bin/mac-test'
+```
+
+Then run it from anywhere:
+
+```bash
+mac-test
+```
+
+> **Note:** on a stock macOS, `/usr/local/bin` is owned by root, so the command
+> automatically retries with `sudo` — just enter your password when prompted.
+> (Or make the directory yours once: `sudo chown $(whoami) /usr/local/bin`.)
+
+### From a local clone
 
 ```bash
 ./release/macos_check-arm64
